@@ -41,7 +41,7 @@ INIT(宽,高) -> SHMEM(共享内存名) -> BLIT(x,y,w,h) -> ACTIVE(x,y,w,h)
 
 ## 用法
 
-**日常：双击 `EveMumbleOverlay.exe`** —— 单文件、免安装 Python、不弹控制台，右下角托盘出现绿色圆点图标。
+**日常：下载 [Releases](https://github.com/Humeng850/eve-mumble-overlay/releases/latest) 里的 `EveMumbleOverlay.exe` 并双击** —— 单文件、免安装 Python、不弹控制台，右下角托盘出现绿色圆点图标。
 
 > 首次运行如果弹「Windows 已保护你的电脑」（因为 exe 没有代码签名），点「更多信息 → 仍要运行」。
 > 若杀软误报，把该 exe 加进白名单；它只做三件事：连 Mumble 的本地命名管道、贴一个透明窗口、写自己的日志。
@@ -80,7 +80,7 @@ INIT(宽,高) -> SHMEM(共享内存名) -> BLIT(x,y,w,h) -> ACTIVE(x,y,w,h)
 
 | 文件 | 作用 |
 | --- | --- |
-| `EveMumbleOverlay.exe` | **成品单文件**（约 10 MB，免 Python，无控制台，带图标） |
+| `EveMumbleOverlay.exe` | **成品单文件**（约 10 MB，免 Python，无控制台，带图标）—— 不打进仓库，从 [Releases](https://github.com/Humeng850/eve-mumble-overlay/releases/latest) 下载 |
 | `EveMumbleOverlay.pyw` | 源码（单文件，含托盘 / 窗口跟随 / 管道客户端，只能标准库） |
 | `build.bat` | 改完源码后一键重新打包 exe |
 | `overlay.ico` | 托盘 / exe 图标 |
