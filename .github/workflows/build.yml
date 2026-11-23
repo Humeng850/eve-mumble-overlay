@@ -1,0 +1,65 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller
+
+      - name: Build single-file exe
+        shell: pwsh
+        run: |
+          python -m PyInstaller --noconfirm --clean --onefile --noconsole `
+            --name EveMumbleOverlay `
+            --icon "${{ github.workspace }}\overlay.ico" `
+            --distpath dist --workpath build --specpath build EveMumbleOverlay.pyw
+
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          $exe = "dist\EveMumbleOverlay.exe"
+          if (-not (Test-Path $exe)) { throw "exe not built" }
+          & $exe --autostart off
+          if ($LASTEXITCODE -ne 0) { throw "smoke test failed with exit code $LASTEXITCODE" }
+          $size = (Get-Item $exe).Length
+          Write-Host "built exe: $size bytes"
+          if ($size -lt 3MB) { throw "exe looks too small: $size bytes" }
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: EveMumbleOverlay
+          path: dist/EveMumbleOverlay.exe
+          if-no-files-found: error
+
+      - name: Attach exe to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/EveMumbleOverlay.exe
+          generate_release_notes: true
+          overwrite_files: true
