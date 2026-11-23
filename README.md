@@ -50,7 +50,8 @@ INIT(宽,高) -> SHMEM(共享内存名) -> BLIT(x,y,w,h) -> ACTIVE(x,y,w,h)
 
 | 菜单项 | 作用 |
 | --- | --- |
-| 显示浮层 / 隐藏浮层 | 临时屏蔽（等同于热键 `Ctrl+Alt+M`） |
+| 屏蔽浮层 / 启用浮层 | 临时暂停显示（等同于热键 `Ctrl+Alt+M`） |
+| 全部客户端同时显示 | 勾选后所有可见的 EVE 客户端各贴一份浮层；默认只跟随前台客户端。开关记在 `config.json` |
 | 开机自动启动 | 勾选后写入 `HKCU\...\Run`，开机静默拉起（显示当前状态） |
 | 打开日志文件 | 出问题时看这里 |
 | 退出 | 关掉整个程序 |
@@ -67,11 +68,23 @@ INIT(宽,高) -> SHMEM(共享内存名) -> BLIT(x,y,w,h) -> ACTIVE(x,y,w,h)
 
 排错时用 `run.bat`（跑源码版，带控制台输出）。
 
+## 启动顺序
+
+**无关。** 三种顺序都验证过（`tools/test_order.py`）：
+
+| 顺序 | 行为 |
+| --- | --- |
+| 插件 → Mumble → EVE | 启动后先空跑等待；Mumble 起来 3 秒内连上管道；EVE 窗口出现 0.5 秒内锁定并显示 |
+| 插件 → EVE → Mumble | 先锁定窗口、打一条"等待 Mumble 覆盖层管道"日志；Mumble 起来后自动连上 |
+| 三者都在，随便换客户端 | 跟随前台切换，画布与管道全程复用 |
+
 ## 已知限制
 
 - **必须窗口化 / 无边框窗口**。独占全屏（exclusive fullscreen）下任何置顶窗口都盖不上去，这是 Windows 的限制，不是本项目的问题。EVE 默认窗口化，用 EVE-O-Preview 的也必然是窗口化。
-- 同一时刻只在**一个**客户端上显示：跟随当前前台的 EVE 客户端，切走即隐藏、切回即恢复。
-  要做「4 个客户端同时各一份浮层」需要另加多窗口管理。
+- 默认只在**一个**客户端上显示（跟随当前前台）；要 4 开同时显示，勾选托盘菜单的「全部客户端同时显示」。
+  多客户端模式共用**一块画布**（Mumble 对同一画布尺寸渲染的内容完全一样），所以开几个客户端内存都不会翻倍。
+- 画布在程序运行期间保持，不因客户端消失而重建 —— 切窗口/最小化再恢复都不会重新连管道。
+  只有反复改动游戏分辨率、画布超过 3 块时才淘汰最久未用的那块。
 - 需要 Mumble 客户端已连接服务器且「游戏内显示」处于启用状态（否则管道里没有内容）。
 - exe 是 PyInstaller onefile 打包，启动时要把运行时解到临时目录，冷启动约 1~2 秒；这不影响浮层本身。
 - 源码版 `EveMumbleOverlay.pyw` 仍然可用（需要本机 Python 3，零第三方包）。
@@ -90,6 +103,8 @@ INIT(宽,高) -> SHMEM(共享内存名) -> BLIT(x,y,w,h) -> ACTIVE(x,y,w,h)
 | `tools/probe_pipe.py` | 诊断：连管道并把 Mumble 渲染的位图导出成 `overlay_dump.bmp` |
 | `tools/window_report.py` | 诊断：列出所有 EVE 客户端窗口的位置/最小化/前台状态 |
 | `tools/switch_test.py` | 回归测试：模拟 EVE-O-Preview 的窗口切换，验证浮层跟随与恢复 |
+| `tools/test_multi.py` | 回归测试：多客户端模式产出 2 个浮层窗口、分别贴在各自客户区原点 |
+| `tools/test_order.py` | 回归测试：Mumble 后启动 / EVE 后启动 / 两者都没启动，均能自动接管 |
 | `tools/capture_screen.py` | 诊断：抓全屏成 BMP |
 | `tools/crop_bmp.py` | 诊断：裁切 BMP 局部 |
 | `tools/make_icon.py` | 重新生成 `overlay.ico` |
@@ -111,7 +126,8 @@ python EveMumbleOverlay.pyw                  :: 有控制台时打印日志
 python EveMumbleOverlay.pyw --autostart on   :: 直接写开机自启（off 取消）
 python EveMumbleOverlay.pyw --pid 43252      :: 绑定指定 EVE 客户端
 python EveMumbleOverlay.pyw --duration 20    :: 自测，20 秒后退出
-python EveMumbleOverlay.pyw --size 1280x720  :: 调试画布，不找 EVE
+python EveMumbleOverlay.pyw --multi          :: 所有可见客户端同时显示
+python EveMumbleOverlay.pyw --single         :: 强制只跟随前台客户端
 ```
 
 ## 构建
