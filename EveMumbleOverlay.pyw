@@ -1,16 +1,24 @@
 """EVE Online + Mumble 说话浮层 —— 托盘常驻单文件版。
 
-双击本文件（.pyw 用 pythonw 打开）即：无控制台窗口、托盘出现图标、随 Mumble 自动接管。
+双击本文件（.pyw 用 pythonw 打开）即：无控制台窗口、托盘出现图标、随 Mumble / EVE 自动接管。
 原理：Mumble 客户端在 \\\\.\\pipe\\MumbleOverlayPipe 上做服务端，把整个浮层渲染成
 ARGB 预乘位图放进共享内存，再用 BLIT 消息告诉客户端贴哪块。本程序扮演"虚拟 overlay
 客户端"，把位图贴到置顶、鼠标穿透的分层窗口上。不注入、不 hook DirectX。
 
+多客户端：Mumble 对同一个画布尺寸渲染出来的位图是完全一样的，所以"一个画布 + N 个窗口"即可，
+不必给每个客户端各连一条管道。托盘菜单「全部客户端同时显示」可切换，开关会记进 config.json。
+
+启动顺序无关：每 0.4 秒扫一次窗口，游戏后开也会在 1 秒内自动接管。
+
 命令行（可选）：
-    pythonw EveMumbleOverlay.pyw                 正常常驻
-    python  EveMumbleOverlay.pyw --duration 10   自测，10 秒后自动退出（有控制台时打印日志）
-    python  EveMumbleOverlay.pyw --pid 32256     绑定指定 EVE 客户端
+    pythonw EveMumbleOverlay.pyw                 正常常驻（单客户端，跟随前台）
+    python  EveMumbleOverlay.pyw --multi         所有可见客户端同时显示
+    python  EveMumbleOverlay.pyw --single        强制只跟随前台客户端
+    python  EveMumbleOverlay.pyw --duration 10   自测，10 秒后自动退出
+    python  EveMumbleOverlay.pyw --pid 32256     只跟指定 EVE 进程
     python  EveMumbleOverlay.pyw --autostart on  写开机自启（off 取消）
 日志：%LOCALAPPDATA%\\EveMumbleOverlay\\overlay.log
+配置：%LOCALAPPDATA%\\EveMumbleOverlay\\config.json
 
 许可说明：本程序独立实现 Mumble 覆盖层的通信协议（仅使用协议常量与字段宽度这类互操作
 必需的事实信息，见 mumble 仓库 overlay/overlay.h，BSD-3-Clause，版权归 The Mumble
@@ -20,6 +28,7 @@ Developers），未复制、未链接、未分发 Mumble 的任何源码或二�
 import argparse
 import ctypes
 import ctypes.wintypes as wt
+import json
 import os
 import struct
 import sys
@@ -30,6 +39,7 @@ import time
 APP_TITLE = "EVE 语音浮层"
 APP_NAME = "EveMumbleOverlay"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+TH32CS_SNAPPROCESS = 0x00000002
 
 INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 GENERIC_READ = 0x80000000
@@ -58,7 +68,6 @@ MOD_ALT = 0x0001
 WM_HOTKEY = 0x0312
 WM_DESTROY = 0x0002
 WM_CLOSE = 0x0010
-WM_COMMAND = 0x0111
 WM_CONTEXTMENU = 0x007B
 WM_LBUTTONUP = 0x0202
 WM_LBUTTONDBLCLK = 0x0203
@@ -85,6 +94,7 @@ IDM_TOGGLE = 1001
 IDM_AUTOSTART = 1002
 IDM_LOG = 1003
 IDM_EXIT = 1004
+IDM_MULTI = 1005
 WM_TRAY = 0x8001
 
 # Mumble overlay 协议（mumble 仓库 overlay/overlay.h，v1.5.915 与 master 一致）
@@ -102,6 +112,14 @@ LOG_DIR = os.path.join(
     os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "EveMumbleOverlay"
 )
 LOG_PATH = os.path.join(LOG_DIR, "overlay.log")
+CONFIG_PATH = os.path.join(LOG_DIR, "config.json")
+
+EVE_EXE = "exefile.exe"
+SCAN_INTERVAL = 0.4
+SWITCH_DEBOUNCE = 0.3
+TOPMOST_INTERVAL = 1.0
+RECONNECT_INTERVAL = 3.0
+MAX_CANVASES = 3
 
 # ------------------------------------------------------------------ Win32
 
@@ -112,6 +130,11 @@ shell32 = ctypes.WinDLL("shell32", use_last_error=True)
 
 WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM)
 WNDENUMPROC = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+
+# 窗口类只注册一次，回调对象常驻（否则回调被 GC 后，已注册的窗口类会调用野指针直接崩进程）
+_current_app = None
+_keep_alive = []
+_classes_ready = False
 
 
 class WNDCLASSW(ctypes.Structure):
@@ -167,6 +190,21 @@ class NOTIFYICONDATAW(ctypes.Structure):
         ("szInfo", wt.WCHAR * 256), ("uVersion", wt.UINT),
         ("szInfoTitle", wt.WCHAR * 64), ("dwInfoFlags", wt.DWORD),
         ("guidItem", ctypes.c_byte * 16), ("hBalloonIcon", wt.HICON),
+    ]
+
+
+class PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", wt.DWORD),
+        ("cntUsage", wt.DWORD),
+        ("th32ProcessID", wt.DWORD),
+        ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+        ("th32ModuleID", wt.DWORD),
+        ("cntThreads", wt.DWORD),
+        ("th32ParentProcessID", wt.DWORD),
+        ("pcPriClassBase", ctypes.c_long),
+        ("dwFlags", wt.DWORD),
+        ("szExeFile", wt.WCHAR * 260),
     ]
 
 
@@ -269,9 +307,46 @@ k32.GetModuleHandleW.restype = wt.HMODULE
 k32.GetModuleHandleW.argtypes = [wt.LPCWSTR]
 k32.CreateMutexW.restype = wt.HANDLE
 k32.CreateMutexW.argtypes = [wt.LPVOID, wt.BOOL, wt.LPCWSTR]
+k32.CreateToolhelp32Snapshot.restype = wt.HANDLE
+k32.CreateToolhelp32Snapshot.argtypes = [wt.DWORD, wt.DWORD]
+k32.Process32FirstW.restype = wt.BOOL
+k32.Process32FirstW.argtypes = [wt.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+k32.Process32NextW.restype = wt.BOOL
+k32.Process32NextW.argtypes = [wt.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
 
 shell32.Shell_NotifyIconW.argtypes = [wt.DWORD, ctypes.POINTER(NOTIFYICONDATAW)]
 shell32.Shell_NotifyIconW.restype = wt.BOOL
+
+MSG_CLASS = "EveMumbleOverlayMsg"
+OVERLAY_CLASS = "EveMumbleOverlayWnd"
+
+
+def _overlay_proc(hwnd, msg, wparam, lparam):
+    return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+
+def _msg_proc(hwnd, msg, wparam, lparam):
+    app = _current_app
+    if app is not None:
+        return app.handle_message(hwnd, msg, wparam, lparam)
+    return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+
+def register_window_classes():
+    """注册浮层窗口类与消息窗口类（进程内只做一次）。"""
+    global _classes_ready
+    if _classes_ready:
+        return
+    for name, proc in ((OVERLAY_CLASS, _overlay_proc), (MSG_CLASS, _msg_proc)):
+        cb = WNDPROC(proc)
+        _keep_alive.append(cb)
+        wc = WNDCLASSW()
+        wc.lpfnWndProc = cb
+        wc.hInstance = k32.GetModuleHandleW(None)
+        wc.lpszClassName = name
+        _keep_alive.append(wc)
+        user32.RegisterClassW(ctypes.byref(wc))
+    _classes_ready = True
 
 # ------------------------------------------------------------------ 日志
 
@@ -293,6 +368,26 @@ def log(msg):
             f.write(line + "\n")
     except Exception:
         pass
+
+
+# ------------------------------------------------------------------ 配置
+
+def load_config():
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_config(cfg):
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        log("保存配置失败: %s" % exc)
 
 
 # ------------------------------------------------------------------ 开机自启
@@ -402,9 +497,30 @@ def create_tray_icon():
     return hicon
 
 
-# ------------------------------------------------------------------ EVE 窗口
+# ------------------------------------------------------------------ 进程 / 窗口
 
 _name_cache = {}
+
+
+def list_process_pids(exe_name):
+    """按可执行文件名枚举进程 PID（启动时探测 EVE 客户端用）。"""
+    pids = []
+    snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if not snap or snap == INVALID_HANDLE_VALUE:
+        return pids
+    try:
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        if not k32.Process32FirstW(snap, ctypes.byref(entry)):
+            return pids
+        while True:
+            if entry.szExeFile.lower() == exe_name:
+                pids.append(int(entry.th32ProcessID))
+            if not k32.Process32NextW(snap, ctypes.byref(entry)):
+                break
+    finally:
+        k32.CloseHandle(snap)
+    return pids
 
 
 def process_image_name(pid):
@@ -426,6 +542,7 @@ def process_image_name(pid):
 
 
 def find_eve_windows(pid_filter=None):
+    """列出可见、非最小化、客户区不小于 320x240 的 EVE 客户端窗口。"""
     found = []
 
     def cb(hwnd, _):
@@ -436,7 +553,7 @@ def find_eve_windows(pid_filter=None):
         if pid_filter is not None:
             if pid.value != pid_filter:
                 return True
-        elif process_image_name(pid.value) != "exefile.exe":
+        elif process_image_name(pid.value) != EVE_EXE:
             return True
         rc = wt.RECT()
         if not user32.GetClientRect(hwnd, ctypes.byref(rc)):
@@ -455,6 +572,17 @@ def client_origin(hwnd):
     pt = wt.POINT(0, 0)
     user32.ClientToScreen(hwnd, ctypes.byref(pt))
     return pt.x, pt.y
+
+
+def window_usable(hwnd):
+    if not hwnd or not user32.IsWindow(hwnd):
+        return False
+    if not user32.IsWindowVisible(hwnd) or user32.IsIconic(hwnd):
+        return False
+    rc = wt.RECT()
+    if not user32.GetClientRect(hwnd, ctypes.byref(rc)):
+        return False
+    return (rc.right - rc.left) >= 64 and (rc.bottom - rc.top) >= 64
 
 
 # ------------------------------------------------------------------ Mumble 管道
@@ -553,72 +681,15 @@ class OverlayPipe:
             log("映射共享内存失败: %r" % name)
             return
         self.shm_map, self.shm_ptr = hmap, ptr
-        log("共享内存就绪: %s" % name)
 
 
-# ------------------------------------------------------------------ 应用主体
+# ------------------------------------------------------------------ 画布 / 窗口
 
-class App:
-    def __init__(self, args):
-        self.args = args
-        self.running = True
-        self.showing = False
-        self.enabled = True
-        self.topmost_at = 0.0
-        self.blit_seen = 0
-        self.width = 0
-        self.height = 0
-        self.dib = None
-        self.dib_bits = None
-        self.mem_dc = None
-        self.hwnd = None
-        self.hicon = None
-        self.pipe = OverlayPipe()
-        self.target_hwnd = None
-        self.pid_filter = args.pid
-        self.target_pid = args.pid
-        self.pos = (0, 0)
-        self.last_active = (0, 0, 0, 0)
-        self.pending_resize = None
-        self.resize_deadline = 0.0
-        self.reconnect_at = 0.0
-        self.scan_at = 0.0
-        self.fg_seen = None
-        self.fg_since = 0.0
-        self.status = ""
-        self.start = time.time()
-        self.hint_shown = False
-        self.first_content = False
-        self._wndproc = WNDPROC(self._proc)
-        self._wc = WNDCLASSW()
+class Canvas:
+    """一块 ARGB 预乘位图，尺寸与 EVE 客户区一致；多个窗口可以共享同一块。"""
 
-    # -- 窗口 --
-
-    def create_window(self):
-        cls = "EveMumbleOverlayWnd"
-        self._wc.lpfnWndProc = self._wndproc
-        self._wc.hInstance = k32.GetModuleHandleW(None)
-        self._wc.lpszClassName = cls
-        user32.RegisterClassW(ctypes.byref(self._wc))
-        ex = (
-            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST
-            | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
-        )
-        self.hwnd = user32.CreateWindowExW(
-            ex, cls, APP_TITLE, WS_POPUP,
-            -32000, -32000, 8, 8, None, None, self._wc.hInstance, None,
-        )
-        if not self.hwnd:
-            raise ctypes.WinError(ctypes.get_last_error())
-
-    def ensure_canvas(self, width, height):
-        if width < 64 or height < 64:
-            log("忽略异常的客户区尺寸 %dx%d（窗口可能被最小化/移出屏幕）" % (width, height))
-            return False
-        if (width, height) == (self.width, self.height) and self.dib:
-            return True
-        self.destroy_canvas()
-        self.width, self.height = width, height
+    def __init__(self, width, height):
+        self.w, self.h = width, height
         bmi = BITMAPINFO()
         bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
         bmi.bmiHeader.biWidth = width
@@ -634,86 +705,126 @@ class App:
         user32.ReleaseDC(None, screen)
         if not self.dib:
             raise ctypes.WinError(ctypes.get_last_error())
-        self.dib_bits = bits
+        self.bits = bits
         self.mem_dc = gdi32.CreateCompatibleDC(None)
         gdi32.SelectObject(self.mem_dc, self.dib)
-        return True
 
-    def destroy_canvas(self):
+    def clear(self):
+        if self.bits:
+            ctypes.memset(self.bits, 0, self.w * self.h * 4)
+
+    def destroy(self):
         if self.mem_dc:
             gdi32.DeleteDC(self.mem_dc)
             self.mem_dc = None
         if self.dib:
             gdi32.DeleteObject(self.dib)
             self.dib = None
-        self.dib_bits = None
-        self.width = self.height = 0
+        self.bits = None
 
-    def present(self):
-        if not self.dib_bits or not self.hwnd:
+
+_wnd_seq = [0]
+
+
+class OverlayWindow:
+    """一个置顶、鼠标穿透的分层窗口。内容由外部给的 Canvas 提供。"""
+
+    def __init__(self):
+        _wnd_seq[0] += 1
+        self.tag = _wnd_seq[0]
+        self.hwnd = None
+        self.visible = False
+
+    def create(self):
+        register_window_classes()
+        ex = (
+            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST
+            | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
+        )
+        self.hwnd = user32.CreateWindowExW(
+            ex, OVERLAY_CLASS, APP_TITLE, WS_POPUP,
+            -32000, -32000, 8, 8, None, None, k32.GetModuleHandleW(None), None,
+        )
+        if not self.hwnd:
+            raise ctypes.WinError(ctypes.get_last_error())
+        return self.hwnd
+
+    def present(self, canvas, x, y):
+        if not self.hwnd or not canvas.bits:
             return
         screen = user32.GetDC(None)
-        pt_dst = wt.POINT(self.pos[0], self.pos[1])
-        size = wt.SIZE(self.width, self.height)
+        pt_dst = wt.POINT(x, y)
+        size = wt.SIZE(canvas.w, canvas.h)
         pt_src = wt.POINT(0, 0)
         blend = BLENDFUNCTION(AC_SRC_OVER, 0, 255, AC_SRC_ALPHA)
         user32.UpdateLayeredWindow(
             self.hwnd, screen, ctypes.byref(pt_dst), ctypes.byref(size),
-            self.mem_dc, ctypes.byref(pt_src), 0, ctypes.byref(blend), ULW_ALPHA,
+            canvas.mem_dc, ctypes.byref(pt_src), 0, ctypes.byref(blend), ULW_ALPHA,
         )
         user32.ReleaseDC(None, screen)
 
-    def set_visible(self, visible):
-        if visible == self.showing:
+    def show(self, visible):
+        if visible == self.visible or not self.hwnd:
             return
-        self.showing = visible
-        log("浮层%s" % ("显示" if visible else "隐藏"))
+        self.visible = visible
         if visible:
             user32.ShowWindow(self.hwnd, SW_SHOWNOACTIVATE)
-            self.topmost_at = time.time()
             user32.SetWindowPos(
                 self.hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
             )
         else:
             user32.ShowWindow(self.hwnd, SW_HIDE)
 
-    def reassert_topmost(self, now):
-        """EVE-O-Preview 的预览窗也是 topmost，会被压到我们上面，定期重新置顶。"""
-        if not self.hwnd or not self.showing:
-            return
-        if now - self.topmost_at < 1.0:
-            return
-        self.topmost_at = now
-        user32.SetWindowPos(
-            self.hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
+    def raise_topmost(self):
+        if self.hwnd and self.visible:
+            user32.SetWindowPos(
+                self.hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
+            )
+
+    def destroy(self):
+        if self.hwnd:
+            user32.DestroyWindow(self.hwnd)
+            self.hwnd = None
+        self.visible = False
+
+
+# ------------------------------------------------------------------ 应用主体
+
+class App:
+    def __init__(self, args):
+        self.args = args
+        self.running = True
+        self.enabled = True
+        cfg = load_config()
+        self.multi = bool(args.multi) or (bool(cfg.get("multi")) and not args.single)
+
+        self.msg_hwnd = None
+        self.hicon = None
+        self.wins = {}       # EVE 窗口 hwnd -> {pid, size, pos, presented, win, topmost_at}
+        self.rend = {}       # (w,h) -> {canvas, pipe, active, dirty}
+        self.pid_filter = args.pid
+        self.pending_pick = None
+        self.pending_since = 0.0
+        self.scan_at = 0.0
+        self.reconnect_at = 0.0
+        self.status = ""
+        self.start = time.time()
+        self.blit_seen = 0
+        self.first_content = False
+        self.hint_shown = False
+
+    # -- 消息窗口（托盘 / 热键用，不随客户端窗口创建销毁而消失） --
+
+    def create_message_window(self):
+        global _current_app
+        register_window_classes()
+        _current_app = self
+        self.msg_hwnd = user32.CreateWindowExW(
+            0, MSG_CLASS, APP_TITLE, WS_POPUP, -32000, -32000, 8, 8,
+            None, None, k32.GetModuleHandleW(None), None,
         )
-
-    def target_ok(self):
-        if not self.target_hwnd or not user32.IsWindow(self.target_hwnd):
-            return False
-        if not user32.IsWindowVisible(self.target_hwnd) or user32.IsIconic(self.target_hwnd):
-            return False
-        rc = wt.RECT()
-        if not user32.GetClientRect(self.target_hwnd, ctypes.byref(rc)):
-            return False
-        return (rc.right - rc.left) >= 64 and (rc.bottom - rc.top) >= 64
-
-    def update_visibility(self, has_content, now):
-        """可见性每帧推导，而不是"藏了就忘"：屏蔽 / 目标不可用 / 没内容，三者任一成立就隐藏。"""
-        target_ok = True if self.args.size else self.target_ok()
-        want = bool(self.enabled and has_content and self.dib_bits and target_ok)
-        self.set_visible(want)
-        if want:
-            self.reassert_topmost(now)
-
-    def toggle_enabled(self):
-        self.enabled = not self.enabled
-        if not self.enabled:
-            self.set_visible(False)
-        log(
-            "浮层已%s（%s）"
-            % ("启用" if self.enabled else "屏蔽", "有人说话时显示" if self.enabled else "暂停显示")
-        )
+        if not self.msg_hwnd:
+            raise ctypes.WinError(ctypes.get_last_error())
 
     # -- 托盘 --
 
@@ -721,7 +832,7 @@ class App:
         self.hicon = create_tray_icon()
         nid = NOTIFYICONDATAW()
         nid.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
-        nid.hWnd = self.hwnd
+        nid.hWnd = self.msg_hwnd
         nid.uID = 1
         nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
         nid.uCallbackMessage = WM_TRAY
@@ -733,7 +844,7 @@ class App:
     def balloon(self, title, text):
         nid = NOTIFYICONDATAW()
         nid.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
-        nid.hWnd = self.hwnd
+        nid.hWnd = self.msg_hwnd
         nid.uID = 1
         nid.uFlags = NIF_INFO
         nid.szInfoTitle = title[:63]
@@ -747,7 +858,7 @@ class App:
         self.status = text
         nid = NOTIFYICONDATAW()
         nid.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
-        nid.hWnd = self.hwnd
+        nid.hWnd = self.msg_hwnd
         nid.uID = 1
         nid.uFlags = NIF_TIP
         nid.szTip = text[:127]
@@ -756,7 +867,7 @@ class App:
     def remove_tray(self):
         nid = NOTIFYICONDATAW()
         nid.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
-        nid.hWnd = self.hwnd
+        nid.hWnd = self.msg_hwnd
         nid.uID = 1
         shell32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(nid))
 
@@ -764,26 +875,38 @@ class App:
         menu = user32.CreatePopupMenu()
         if not menu:
             return
-        user32.AppendMenuW(menu, MF_STRING, IDM_TOGGLE,
-                           "屏蔽浮层（暂停显示）" if self.enabled else "启用浮层")
+        user32.AppendMenuW(
+            menu, MF_STRING, IDM_TOGGLE,
+            "屏蔽浮层（暂停显示）" if self.enabled else "启用浮层",
+        )
+        user32.AppendMenuW(
+            menu, MF_STRING | (MF_CHECKED if self.multi else 0), IDM_MULTI,
+            "全部客户端同时显示",
+        )
         user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
-        flags = MF_STRING | (MF_CHECKED if autostart_enabled() else 0)
-        user32.AppendMenuW(menu, flags, IDM_AUTOSTART, "开机自动启动")
+        user32.AppendMenuW(
+            menu,
+            MF_STRING | (MF_CHECKED if autostart_enabled() else 0),
+            IDM_AUTOSTART,
+            "开机自动启动",
+        )
         user32.AppendMenuW(menu, MF_STRING, IDM_LOG, "打开日志文件")
         user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
         user32.AppendMenuW(menu, MF_STRING, IDM_EXIT, "退出")
 
         pt = wt.POINT(0, 0)
         user32.GetCursorPos(ctypes.byref(pt))
-        user32.SetForegroundWindow(self.hwnd)
+        user32.SetForegroundWindow(self.msg_hwnd)
         cmd = user32.TrackPopupMenu(
-            menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, self.hwnd, None
+            menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, self.msg_hwnd, None
         )
-        user32.PostMessageW(self.hwnd, 0, 0, 0)
+        user32.PostMessageW(self.msg_hwnd, 0, 0, 0)
         user32.DestroyMenu(menu)
 
         if cmd == IDM_TOGGLE:
             self.toggle_enabled()
+        elif cmd == IDM_MULTI:
+            self.toggle_multi()
         elif cmd == IDM_AUTOSTART:
             set_autostart(not autostart_enabled())
         elif cmd == IDM_LOG:
@@ -794,7 +917,28 @@ class App:
         elif cmd == IDM_EXIT:
             self.running = False
 
-    def _proc(self, hwnd, msg, wparam, lparam):
+    def toggle_enabled(self):
+        self.enabled = not self.enabled
+        if not self.enabled:
+            for t in self.wins.values():
+                t["win"].show(False)
+        log(
+            "浮层已%s（%s）"
+            % ("启用" if self.enabled else "屏蔽", "有人说话时显示" if self.enabled else "暂停显示")
+        )
+
+    def toggle_multi(self):
+        self.multi = not self.multi
+        cfg = load_config()
+        cfg["multi"] = self.multi
+        save_config(cfg)
+        log(
+            "多客户端模式已%s"
+            % ("开启（所有可见客户端同时显示）" if self.multi else "关闭（只跟随前台客户端）")
+        )
+        self.apply({})
+
+    def handle_message(self, hwnd, msg, wparam, lparam):
         if msg == WM_TRAY:
             event = lparam & 0xFFFF
             if event in (WM_RBUTTONUP, WM_CONTEXTMENU):
@@ -820,67 +964,195 @@ class App:
             user32.TranslateMessage(ctypes.byref(msg))
             user32.DispatchMessageW(ctypes.byref(msg))
 
-    # -- 目标窗口 --
+    # -- 目标发现 --
 
-    def refresh_target(self):
-        """跟随前台的 EVE 客户端。
+    def scan_targets(self):
+        candidates = find_eve_windows(self.pid_filter)
+        if not candidates:
+            self.apply({})
+            self.set_tip("%s：等待 EVE 窗口" % APP_TITLE)
+            return
 
-        EVE-O-Preview 切窗口的做法是把非当前客户端最小化并挪到屏幕外，所以不能死锁一个窗口；
-        只要前台窗口是 EVE 客户端就搬过去，前台不是 EVE（比如 Alt-Tab 到 Mumble）时保持不动。
-        候选窗口要稳定 300ms 才真正切换，避免焦点抖动导致目标乱跳。
-        """
-        wins = find_eve_windows(self.pid_filter)
-        if not wins:
-            self.fg_seen = None
-            return False
-        fg = user32.GetForegroundWindow()
-        fg_win = next((w for w in wins if w[0] == fg), None)
-        if fg_win is not None:
-            cand = fg_win
-            src = "前台"
+        if self.multi:
+            wanted = {c[0]: c for c in candidates}
         else:
-            cur = next((w for w in wins if w[0] == self.target_hwnd), None)
-            cand = cur if cur is not None else wins[0]
-            src = "保持" if cur is not None else "兜底"
+            fg = user32.GetForegroundWindow()
+            pick = next((c for c in candidates if c[0] == fg), None)
+            if pick is None:
+                pick = next((c for c in candidates if c[0] in self.wins), candidates[0])
+            wanted = {pick[0]: pick}
 
+            # 稳定 300ms 才真正切换，避免焦点抖动导致目标乱跳
+            now = time.time()
+            if pick[0] != self.pending_pick:
+                self.pending_pick = pick[0]
+                self.pending_since = now
+            elif pick[0] not in self.wins and now - self.pending_since < SWITCH_DEBOUNCE:
+                keep = next((c for c in candidates if c[0] in self.wins), None)
+                if keep is not None:
+                    wanted = {keep[0]: keep}
+        self.apply(wanted)
+
+    def apply(self, wanted):
+        # 新增 / 更新
+        for chwnd, (hwnd, pid, w, h) in wanted.items():
+            t = self.wins.get(chwnd)
+            if t is None:
+                win = OverlayWindow()
+                win.create()
+                self.wins[chwnd] = {
+                    "pid": pid,
+                    "size": (w, h),
+                    "pos": client_origin(chwnd),
+                    "presented": None,
+                    "win": win,
+                    "topmost_at": 0.0,
+                }
+                log(
+                    "%s EVE 客户端 0x%X pid=%d 客户区 %dx%d"
+                    % ("跟踪" if self.multi else "锁定", chwnd, pid, w, h)
+                )
+            else:
+                if t["size"] != (w, h):
+                    log(
+                        "客户端 0x%X 客户区 %dx%d -> %dx%d"
+                        % (chwnd, t["size"][0], t["size"][1], w, h)
+                    )
+                    t["size"] = (w, h)
+                    t["presented"] = None
+                pos = client_origin(chwnd)
+                if pos != t["pos"]:
+                    t["pos"] = pos
+
+        # 移除
+        for chwnd in list(self.wins):
+            if chwnd not in wanted:
+                t = self.wins.pop(chwnd)
+                t["win"].destroy()
+                log("移除客户端 0x%X（最小化 / 关闭 / 切走）" % chwnd)
+
+        # 画布与管道在程序运行期间保持（不因客户端消失而释放），
+        # 只有画布数量超过上限时才淘汰最久未用的，避免反复拖拽窗口尺寸把内存撑爆
+        used = {t["size"] for t in self.wins.values()}
         now = time.time()
-        if cand[0] != self.fg_seen:
-            self.fg_seen = cand[0]
-            self.fg_since = now
-        if cand[0] != self.target_hwnd:
-            if now - self.fg_since < 0.3:
-                return True
-            log(
-                "候选目标 0x%X pid=%d（%s，前台=0x%X，可见客户端 %d 个）"
-                % (cand[0], cand[1], src, fg, len(wins))
-            )
-        return self.attach(cand)
+        for key in used:
+            r = self.rend.get(key)
+            if r is not None:
+                r["last_used"] = now
+                continue
+            if key[0] < 64 or key[1] < 64:
+                continue
+            try:
+                self.rend[key] = {
+                    "canvas": Canvas(*key),
+                    "pipe": OverlayPipe(),
+                    "active": (0, 0, 0, 0),
+                    "dirty": True,
+                    "last_used": now,
+                }
+                log("新建 %dx%d 画布（程序运行期间保持）" % key)
+            except OSError as exc:
+                log("创建 %dx%d 画布失败: %s" % (key[0], key[1], exc))
 
-    def attach(self, cand):
-        hwnd, pid, w, h = cand
-        first = self.target_hwnd is None
-        size_changed = (w, h) != (self.width, self.height)
-        self.pos = client_origin(hwnd)
-        if hwnd == self.target_hwnd and not size_changed and self.dib_bits:
-            return True
-        self.target_hwnd, self.target_pid = hwnd, pid
-        if size_changed:
-            if not self.ensure_canvas(w, h):
-                return False
-            ctypes.memset(self.dib_bits, 0, w * h * 4)
-            log("画布重建为 %dx%d，重连管道（窗口 0x%X pid=%d）" % (w, h, hwnd, pid))
-            self.pipe.connect(w, h)
-        if first:
-            log("锁定 EVE 窗口 0x%X pid=%d 客户区 %dx%d" % (hwnd, pid, w, h))
-        elif not size_changed:
-            log("切换到 EVE 窗口 0x%X pid=%d（同尺寸，无需重连）" % (hwnd, pid))
-        return True
+        if len(self.rend) > MAX_CANVASES:
+            idle = sorted(
+                (k for k in self.rend if k not in used),
+                key=lambda k: self.rend[k]["last_used"],
+            )
+            for key in idle[: len(self.rend) - MAX_CANVASES]:
+                r = self.rend.pop(key)
+                r["pipe"].close()
+                r["canvas"].destroy()
+                log("画布超过上限 %d，释放最久未用的 %dx%d" % (MAX_CANVASES, key[0], key[1]))
 
     # -- 主循环 --
 
+    def step(self, now):
+        if now >= self.scan_at:
+            self.scan_at = now + SCAN_INTERVAL
+            self.scan_targets()
+
+        # 收位图
+        for key, r in self.rend.items():
+            pipe = r["pipe"]
+            if pipe.h is None and now >= self.reconnect_at:
+                if pipe.connect(key[0], key[1]):
+                    log("已连接覆盖层管道 %dx%d" % key)
+                    r["wait_logged"] = False
+                else:
+                    self.reconnect_at = now + RECONNECT_INTERVAL
+                    if not r.get("wait_logged"):
+                        r["wait_logged"] = True
+                        log(
+                            "等待 Mumble 覆盖层管道（Mumble 未运行，或「游戏内显示」未启用），"
+                            "每 %d 秒重试" % RECONNECT_INTERVAL
+                        )
+            if pipe.pump() and pipe.shm_ptr:
+                ctypes.memmove(
+                    r["canvas"].bits, ctypes.c_void_p(pipe.shm_ptr), key[0] * key[1] * 4
+                )
+                r["dirty"] = True
+                self.blit_seen += 1
+            if pipe.active != r["active"]:
+                r["active"] = pipe.active
+                if pipe.active[2] and pipe.active[3] and not self.first_content:
+                    self.first_content = True
+                    log("检测到说话者")
+
+        # 显示
+        visible_count = 0
+        for chwnd, t in list(self.wins.items()):
+            r = self.rend.get(t["size"])
+            have = bool(r and r["active"][2] and r["active"][3])
+            ok = window_usable(chwnd)
+            want = bool(self.enabled and have and ok and r and r["canvas"].bits)
+            if want:
+                if (not t["win"].visible) or r["dirty"] or t["presented"] != t["pos"]:
+                    t["win"].present(r["canvas"], t["pos"][0], t["pos"][1])
+                    t["presented"] = t["pos"]
+                t["win"].show(True)
+                if now - t["topmost_at"] >= TOPMOST_INTERVAL:
+                    t["topmost_at"] = now
+                    t["win"].raise_topmost()
+                visible_count += 1
+            else:
+                t["win"].show(False)
+
+        for r in self.rend.values():
+            r["dirty"] = False
+
+        if visible_count:
+            self.set_tip(
+                "%s：显示中（%d 个客户端）" % (APP_TITLE, visible_count)
+                if self.multi
+                else "%s：显示中" % APP_TITLE
+            )
+        elif self.wins:
+            self.set_tip("%s：待机（无人说话）" % APP_TITLE)
+        if (
+            self.enabled
+            and not self.first_content
+            and not self.hint_shown
+            and now - self.start >= 15
+        ):
+            self.hint_shown = True
+            log("15 秒内没检测到说话者：确认 Mumble 已连服务器且频道里有人说话")
+
     def run(self):
-        self.create_window()
+        self.create_message_window()
         self.add_tray()
+
+        pids = list_process_pids(EVE_EXE)
+        if pids:
+            log(
+                "启动时检测到 %d 个 EVE 客户端进程：%s"
+                % (len(pids), ", ".join(str(p) for p in pids))
+            )
+        else:
+            log("启动时没检测到 EVE 客户端进程，稍后出现会自动接管")
+        if self.args.pid and pids and self.args.pid not in pids:
+            log("注意：--pid %d 不在当前 EVE 进程列表里，仍会持续等待该进程的窗口" % self.args.pid)
+        log("模式：%s" % ("全部客户端同时显示" if self.multi else "只跟随前台客户端"))
 
         hotkey = None
         for mods, vk, name in (
@@ -888,7 +1160,7 @@ class App:
             (MOD_CONTROL | MOD_ALT, ord("M"), "Ctrl+Alt+M"),
             (MOD_ALT, 0x77, "Alt+F8"),
         ):
-            if user32.RegisterHotKey(self.hwnd, 1, mods, vk):
+            if user32.RegisterHotKey(self.msg_hwnd, 1, mods, vk):
                 hotkey = name
                 break
         log("托盘已启动，热键：%s" % (hotkey or "无（都被占用）"))
@@ -896,113 +1168,40 @@ class App:
         if not self.args.duration:
             self.balloon(
                 APP_TITLE,
-                "已启动并在托盘常驻。右键托盘图标可设置开机自启；双击图标可临时隐藏/显示。",
+                "已启动并在托盘常驻。右键托盘图标可切换「全部客户端同时显示」与开机自启。",
             )
-
-        fixed = None
-        if self.args.size:
-            fixed = tuple(int(v) for v in self.args.size.lower().split("x"))
-            self.pos = (100, 100)
-            self.ensure_canvas(*fixed)
 
         try:
             while self.running:
                 self.pump_messages()
                 now = time.time()
-
                 if self.args.duration and now - self.start >= self.args.duration:
                     log("自测结束，共 %d 批位图更新" % self.blit_seen)
                     break
-
-                if fixed is None:
-                    if now >= self.scan_at:
-                        self.scan_at = now + 0.4
-                        if not self.refresh_target():
-                            self.set_tip("%s：等待 EVE 窗口" % APP_TITLE)
-                    if self.target_hwnd:
-                        self.follow_window(now)
-
-                if self.dib_bits and not self.pipe.h and now >= self.reconnect_at:
-                    if not self.pipe.connect(self.width, self.height):
-                        self.reconnect_at = now + 3.0
-                        self.set_tip("%s：等待 Mumble" % APP_TITLE)
-                    else:
-                        log("已连接 Mumble 覆盖层管道")
-                        self.set_tip("%s：已连接，待机" % APP_TITLE)
-
-                if self.pipe.pump() and self.pipe.shm_ptr and self.dib_bits:
-                    self.blit_seen += 1
-                    ctypes.memmove(
-                        self.dib_bits, ctypes.c_void_p(self.pipe.shm_ptr),
-                        self.width * self.height * 4,
-                    )
-                    self.present()
-
-                active = self.pipe.active
-                if active != self.last_active:
-                    self.last_active = active
-                    if active[2] and active[3]:
-                        if not self.first_content:
-                            self.first_content = True
-                            log("检测到说话者")
-                        self.set_tip("%s：显示中" % APP_TITLE)
-                    elif self.first_content:
-                        self.set_tip("%s：待机（无人说话）" % APP_TITLE)
-
-                self.update_visibility(bool(active[2] and active[3]), now)
-
-                if (
-                    self.pipe.h and not self.first_content and not self.hint_shown
-                    and now - self.start >= 15
-                ):
-                    self.hint_shown = True
-                    log("15 秒内收到管道但没有任何说话者：确认 Mumble 已连服务器且频道里有人说话")
-
+                self.step(now)
                 time.sleep(0.008)
         finally:
             self.shutdown()
 
-    def follow_window(self, now):
-        """只负责跟随位置与尺寸；显示与否统一由 update_visibility 决定。"""
-        if not self.target_hwnd or not user32.IsWindow(self.target_hwnd):
-            return
-        if user32.IsIconic(self.target_hwnd):
-            return
-        rc = wt.RECT()
-        if not user32.GetClientRect(self.target_hwnd, ctypes.byref(rc)):
-            return
-        cw, ch = rc.right - rc.left, rc.bottom - rc.top
-        if cw < 64 or ch < 64:
-            return
-        if (cw, ch) != (self.width, self.height):
-            if self.pending_resize != (cw, ch):
-                self.pending_resize = (cw, ch)
-                self.resize_deadline = now + 0.6
-            elif now >= self.resize_deadline:
-                if self.ensure_canvas(cw, ch):
-                    log("EVE 客户区变化 -> %dx%d，重建画布并重连" % (cw, ch))
-                    ctypes.memset(self.dib_bits, 0, cw * ch * 4)
-                    self.pipe.connect(cw, ch)
-                self.pending_resize = None
-        else:
-            self.pending_resize = None
-        new_pos = client_origin(self.target_hwnd)
-        if new_pos != self.pos:
-            self.pos = new_pos
-            if self.showing:
-                self.present()
-
     def shutdown(self):
-        self.pipe.close()
+        global _current_app
+        for t in self.wins.values():
+            t["win"].destroy()
+        self.wins.clear()
+        for r in self.rend.values():
+            r["pipe"].close()
+            r["canvas"].destroy()
+        self.rend.clear()
         self.remove_tray()
         if self.hicon:
             user32.DestroyIcon(self.hicon)
             self.hicon = None
-        self.destroy_canvas()
-        if self.hwnd:
-            user32.UnregisterHotKey(self.hwnd, 1)
-            user32.DestroyWindow(self.hwnd)
-            self.hwnd = None
+        if self.msg_hwnd:
+            user32.UnregisterHotKey(self.msg_hwnd, 1)
+            user32.DestroyWindow(self.msg_hwnd)
+            self.msg_hwnd = None
+        if _current_app is self:
+            _current_app = None
         log("已退出")
 
 
@@ -1023,9 +1222,10 @@ def enable_dpi():
 def main():
     ap = argparse.ArgumentParser(add_help=True)
     ap.add_argument("--pid", type=int, default=None)
-    ap.add_argument("--size", default=None, help="调试画布 宽x高")
     ap.add_argument("--duration", type=float, default=0)
     ap.add_argument("--autostart", choices=("on", "off"), default=None)
+    ap.add_argument("--multi", action="store_true", help="所有可见客户端同时显示")
+    ap.add_argument("--single", action="store_true", help="只在前台客户端显示（默认）")
     args = ap.parse_args()
 
     enable_dpi()
