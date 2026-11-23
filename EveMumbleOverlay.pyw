@@ -321,14 +321,23 @@ def autostart_enabled():
 def set_autostart(on):
     import winreg
     try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
-            if on:
+        if on:
+            # Run 键在某些干净环境（新装系统 / 服务账户 / CI runner）里可能不存在，需要自己建
+            with winreg.CreateKeyEx(
+                winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE
+            ) as k:
                 winreg.SetValueEx(k, APP_NAME, 0, winreg.REG_SZ, autostart_command())
-            else:
-                try:
-                    winreg.DeleteValue(k, APP_NAME)
-                except OSError:
-                    pass
+        else:
+            try:
+                with winreg.OpenKey(
+                    winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE
+                ) as k:
+                    try:
+                        winreg.DeleteValue(k, APP_NAME)
+                    except FileNotFoundError:
+                        pass
+            except FileNotFoundError:
+                pass  # 键都没有，等于本来就没开
         log("开机自启已%s" % ("开启" if on else "关闭"))
         return True
     except OSError as exc:
