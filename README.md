@@ -1,5 +1,8 @@
 # EVE Online 语音浮层（Mumble 说话者显示）
 
+[![build](https://github.com/Humeng850/eve-mumble-overlay/actions/workflows/build.yml/badge.svg)](https://github.com/Humeng850/eve-mumble-overlay/actions/workflows/build.yml)
+[![release](https://img.shields.io/github/v/release/Humeng850/eve-mumble-overlay)](https://github.com/Humeng850/eve-mumble-overlay/releases/latest)
+
 Mumble 自带的「游戏内显示 / overlay」在 EVE Online 里不生效。本项目绕开它失效的环节，
 把 Mumble **已经渲染好的**说话者浮层贴到 EVE 窗口上方。
 
@@ -110,6 +113,19 @@ python EveMumbleOverlay.pyw --pid 43252      :: 绑定指定 EVE 客户端
 python EveMumbleOverlay.pyw --duration 20    :: 自测，20 秒后退出
 python EveMumbleOverlay.pyw --size 1280x720  :: 调试画布，不找 EVE
 ```
+
+## 构建
+
+**自动（推荐）**：`.github/workflows/build.yml` 在 `windows-latest` 上跑，流程是
+装 Python 3.12 → 装 PyInstaller → 打包单文件 exe → 冒烟测试（`--autostart off` 必须返回 0 且体积 > 3 MB）→ 上传 artifact。
+
+- 推 `main` / 提 PR：只产出 artifact，不碰 Release
+- 推 `v*` tag：自动创建或更新对应 Release，并把 exe 作为附件上传（同名覆盖）
+- 也能在 Actions 页面手动 `Run workflow`
+
+所以发版只要：`git tag v1.0.1 && git push origin v1.0.1`，其余全自动。
+
+**本地**：双击 `build.bat`（内部就是同一条 PyInstaller 命令，产物覆盖根目录的 exe）。
 
 ## 许可与合规
 
