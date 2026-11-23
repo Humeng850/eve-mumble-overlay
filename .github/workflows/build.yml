@@ -43,8 +43,23 @@ jobs:
         run: |
           $exe = "dist\EveMumbleOverlay.exe"
           if (-not (Test-Path $exe)) { throw "exe not built" }
-          & $exe --autostart off
-          if ($LASTEXITCODE -ne 0) { throw "smoke test failed with exit code $LASTEXITCODE" }
+
+          # GUI 子系统程序必须用 Start-Process -Wait，否则 `&` 不等待、$LASTEXITCODE 是 $null
+          $logDir = Join-Path $env:LOCALAPPDATA 'EveMumbleOverlay'
+          if (Test-Path $logDir) { Remove-Item $logDir -Recurse -Force }
+
+          $p = Start-Process -FilePath $exe -ArgumentList '--autostart', 'off' -Wait -PassThru
+          Write-Host "exit code = $($p.ExitCode)"
+          if ($null -ne $p.ExitCode -and $p.ExitCode -ne 0) {
+            throw "smoke test failed with exit code $($p.ExitCode)"
+          }
+
+          $log = Join-Path $logDir 'overlay.log'
+          if (-not (Test-Path $log)) { throw "程序没有写出日志文件：$log" }
+          $hit = Select-String -Path $log -Pattern '开机自启' -SimpleMatch
+          if (-not $hit) { throw "日志里没有预期的启动记录：" + (Get-Content $log -Raw) }
+          Write-Host "log ok: $($hit.Line)"
+
           $size = (Get-Item $exe).Length
           Write-Host "built exe: $size bytes"
           if ($size -lt 3MB) { throw "exe looks too small: $size bytes" }
